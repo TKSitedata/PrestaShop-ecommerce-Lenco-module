@@ -1,0 +1,593 @@
+<?php
+/**
+ * Copyright since 2007 PrestaShop SA and Contributors
+ * PrestaShop is an International Registered Trademark & Property of PrestaShop SA
+ *
+ * NOTICE OF LICENSE
+ *
+ * This source file is subject to the Academic Free License 3.0 (AFL-3.0)
+ * that is bundled with this package in the file LICENSE.md.
+ * It is also available through the world-wide-web at this URL:
+ * https://opensource.org/licenses/AFL-3.0
+ * If you did not receive a copy of the license and are unable to
+ * obtain it through the world-wide-web, please send an email
+ * to license@prestashop.com so we can send you a copy immediately.
+ *
+ * @author    Lenco Technologies Inc. <support@lenco.co>
+ * @copyright Since 2024 Lenco Technologies Inc.
+ * @license   https://opensource.org/licenses/AFL-3.0 Academic Free License 3.0 (AFL-3.0)
+ */
+
+if (!defined('_PS_VERSION_')) {
+    exit;
+}
+
+class Lenco extends PaymentModule
+{
+    public const CONFIG_ENABLED = 'LENCO_ENABLED';
+    public const CONFIG_PUBLIC_KEY = 'LENCO_PUBLIC_KEY';
+    public const CONFIG_SECRET_KEY = 'LENCO_SECRET_KEY';
+    public const CONFIG_ENVIRONMENT = 'LENCO_ENVIRONMENT';
+    public const CONFIG_CURRENCY = 'LENCO_CURRENCY';
+    public const CONFIG_CHANNELS = 'LENCO_CHANNELS';
+    public const CONFIG_SUCCESS_URL = 'LENCO_SUCCESS_URL';
+    public const CONFIG_OS_PENDING = 'LENCO_OS_PENDING';
+
+    public const LIVEL_API_URL = 'https://api.lenco.co/v1';
+    public const SANDBOX_API_URL = 'https://api.sandbox.lenco.co/v1';
+    public const LIVEL_JS_URL = 'https://pay.lenco.co/js/v1/inline.js';
+    public const SANDBOX_JS_URL = 'https://pay.sandbox.lenco.co/js/v1/inline.js';
+
+    public function __construct()
+    {
+        $this->name = 'lenco';
+        $this->tab = 'payments_gateways';
+        $this->version = '1.0.0';
+        $this->author = 'Lenco Technologies Inc.';
+        $this->need_instance = 1;
+        $this->ps_versions_compliancy = [
+            'min' => '1.7.1.0',
+            'max' => _PS_VERSION_,
+        ];
+        $this->bootstrap = true;
+
+        parent::__construct();
+
+        $this->displayName = $this->l('Lenco Payment Gateway');
+        $this->description = $this->l('Accept payments via Lenco (Card, Mobile Money)');
+
+        $this->confirmUninstall = $this->l('Are you sure you want to uninstall?');
+    }
+
+    /**
+     * Install the module
+     *
+     * @return bool
+     */
+    public function install()
+    {
+        if (!parent::install()) {
+            return false;
+        }
+
+        // Register hooks
+        if (!$this->registerHook('paymentOptions')
+            || !$this->registerHook('paymentReturn')
+            || !$this->registerHook('displayOrderConfirmation')
+            || !$this->registerHook('displayAdminOrderMainBottom')
+        ) {
+            return false;
+        }
+
+        // Create order states
+        if (!$this->createOrderStates()) {
+            return false;
+        }
+
+        // Set default configuration
+        Configuration::updateValue(self::CONFIG_ENABLED, true);
+        Configuration::updateValue(self::CONFIG_ENVIRONMENT, 'sandbox');
+        Configuration::updateValue(self::CONFIG_CURRENCY, 'ZMW');
+        Configuration::updateValue(self::CONFIG_CHANNELS, json_encode(['card', 'mobile-money']));
+        Configuration::updateValue(self::CONFIG_SUCCESS_URL, '');
+
+        // Create database table
+        if (!$this->createDatabaseTable()) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Uninstall the module
+     *
+     * @return bool
+     */
+    public function uninstall()
+    {
+        // Delete configuration
+        Configuration::deleteByName(self::CONFIG_ENABLED);
+        Configuration::deleteByName(self::CONFIG_PUBLIC_KEY);
+        Configuration::deleteByName(self::CONFIG_SECRET_KEY);
+        Configuration::deleteByName(self::CONFIG_ENVIRONMENT);
+        Configuration::deleteByName(self::CONFIG_CURRENCY);
+        Configuration::deleteByName(self::CONFIG_CHANNELS);
+        Configuration::deleteByName(self::CONFIG_SUCCESS_URL);
+
+        // Delete order state
+        $idOrderState = (int) Configuration::get(self::CONFIG_OS_PENDING);
+        if ($idOrderState) {
+            $orderState = new OrderState($idOrderState);
+            if (Validate::isLoadedObject($orderState)) {
+                $orderState->delete();
+            }
+        }
+        Configuration::deleteByName(self::CONFIG_OS_PENDING);
+
+        return parent::uninstall();
+    }
+
+    /**
+     * Create order states for pending payment
+     *
+     * @return bool
+     */
+    private function createOrderStates()
+    {
+        $orderState = new OrderState();
+        $orderState->name = [];
+        foreach (Language::getLanguages(true) as $lang) {
+            $orderState->name[$lang['id_lang']] = 'Awaiting Lenco Payment';
+        }
+        $orderState->send_email = false;
+        $orderState->color = '#FFA500';
+        $orderState->hidden = false;
+        $orderState->delivery = false;
+        $orderState->logable = false;
+        $orderState->invoice = false;
+        $orderState->paid = false;
+
+        if (!$orderState->add()) {
+            return false;
+        }
+
+        Configuration::updateValue(self::CONFIG_OS_PENDING, (int) $orderState->id);
+
+        return true;
+    }
+
+    /**
+     * Create database table for transactions
+     *
+     * @return bool
+     */
+    private function createDatabaseTable()
+    {
+        $sql = 'CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . 'lenco_transactions` (
+            `id_lenco_transaction` INT(11) NOT NULL AUTO_INCREMENT,
+            `id_order` INT(11) NOT NULL,
+            `reference` VARCHAR(255) NOT NULL,
+            `amount` DECIMAL(20,6) NOT NULL DEFAULT 0.000000,
+            `currency` VARCHAR(10) NOT NULL DEFAULT \'ZMW\',
+            `status` ENUM(\'pending\', \'success\', \'failed\', \'cancelled\') NOT NULL DEFAULT \'pending\',
+            `lenco_response` TEXT,
+            `created_at` DATETIME NOT NULL,
+            `updated_at` DATETIME DEFAULT NULL,
+            PRIMARY KEY (`id_lenco_transaction`),
+            UNIQUE KEY `reference` (`reference`),
+            KEY `id_order` (`id_order`),
+            KEY `status` (`status`)
+        ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8;';
+
+        return Db::getInstance()->execute($sql);
+    }
+
+    /**
+     * Get configuration page content
+     *
+     * @return string
+     */
+    public function getContent()
+    {
+        $output = '';
+
+        if (Tools::isSubmit('submit' . $this->name)) {
+            $output .= $this->postProcess();
+        }
+
+        return $output . $this->displayForm();
+    }
+
+    /**
+     * Process configuration form submission
+     *
+     * @return string
+     */
+    private function postProcess()
+    {
+        Configuration::updateValue(self::CONFIG_ENABLED, (bool) Tools::getValue(self::CONFIG_ENABLED));
+        Configuration::updateValue(self::CONFIG_PUBLIC_KEY, Tools::getValue(self::CONFIG_PUBLIC_KEY));
+        Configuration::updateValue(self::CONFIG_SECRET_KEY, Tools::getValue(self::CONFIG_SECRET_KEY));
+        Configuration::updateValue(self::CONFIG_ENVIRONMENT, Tools::getValue(self::CONFIG_ENVIRONMENT));
+        Configuration::updateValue(self::CONFIG_CURRENCY, Tools::getValue(self::CONFIG_CURRENCY));
+        Configuration::updateValue(self::CONFIG_SUCCESS_URL, Tools::getValue(self::CONFIG_SUCCESS_URL));
+
+        $channels = Tools::getValue(self::CONFIG_CHANNELS);
+        if (is_array($channels)) {
+            Configuration::updateValue(self::CONFIG_CHANNELS, json_encode($channels));
+        } else {
+            Configuration::updateValue(self::CONFIG_CHANNELS, json_encode([]));
+        }
+
+        return $this->displayConfirmation($this->l('Settings updated'));
+    }
+
+    /**
+     * Display configuration form
+     *
+     * @return string
+     */
+    private function displayForm()
+    {
+        $form[0]['form'] = [
+            'legend' => [
+                'title' => $this->l('Lenco Payment Configuration'),
+                'icon' => 'icon-credit-card',
+            ],
+            'input' => [
+                [
+                    'type' => 'switch',
+                    'label' => $this->l('Enable Lenco Payment'),
+                    'name' => self::CONFIG_ENABLED,
+                    'is_bool' => true,
+                    'values' => [
+                        ['id' => 'active_on', 'value' => true, 'label' => $this->l('Enabled')],
+                        ['id' => 'active_off', 'value' => false, 'label' => $this->l('Disabled')],
+                    ],
+                ],
+                [
+                    'type' => 'text',
+                    'label' => $this->l('Public Key'),
+                    'name' => self::CONFIG_PUBLIC_KEY,
+                    'desc' => $this->l('Your Lenco public key from the dashboard'),
+                    'required' => true,
+                ],
+                [
+                    'type' => 'text',
+                    'label' => $this->l('Secret Key'),
+                    'name' => self::CONFIG_SECRET_KEY,
+                    'desc' => $this->l('Your Lenco secret key from the dashboard'),
+                    'required' => true,
+                ],
+                [
+                    'type' => 'select',
+                    'label' => $this->l('Environment'),
+                    'name' => self::CONFIG_ENVIRONMENT,
+                    'options' => [
+                        'query' => [
+                            ['id_option' => 'sandbox', 'name' => $this->l('Sandbox (Test)')],
+                            ['id_option' => 'production', 'name' => $this->l('Production (Live)')],
+                        ],
+                        'id' => 'id_option',
+                        'name' => 'name',
+                    ],
+                ],
+                [
+                    'type' => 'select',
+                    'label' => $this->l('Currency'),
+                    'name' => self::CONFIG_CURRENCY,
+                    'options' => [
+                        'query' => [
+                            ['id_option' => 'ZMW', 'name' => 'Zambian Kwacha (ZMW)'],
+                            ['id_option' => 'USD', 'name' => 'US Dollar (USD)'],
+                            ['id_option' => 'EUR', 'name' => 'Euro (EUR)'],
+                            ['id_option' => 'GBP', 'name' => 'British Pound (GBP)'],
+                            ['id_option' => 'ZAR', 'name' => 'South African Rand (ZAR)'],
+                        ],
+                        'id' => 'id_option',
+                        'name' => 'name',
+                    ],
+                ],
+                [
+                    'type' => 'checkbox',
+                    'label' => $this->l('Payment Channels'),
+                    'name' => self::CONFIG_CHANNELS,
+                    'values' => [
+                        'query' => [
+                            ['id_option' => 'card', 'name' => $this->l('Card (Visa, Mastercard)')],
+                            ['id_option' => 'mobile-money', 'name' => $this->l('Mobile Money')],
+                        ],
+                        'id' => 'id_option',
+                        'name' => 'name',
+                    ],
+                ],
+                [
+                    'type' => 'text',
+                    'label' => $this->l('Custom Success URL'),
+                    'name' => self::CONFIG_SUCCESS_URL,
+                    'desc' => $this->l('Optional custom redirect URL after successful payment'),
+                ],
+            ],
+            'submit' => [
+                'title' => $this->l('Save'),
+            ],
+        ];
+
+        $helper = new HelperForm();
+        $helper->module = $this;
+        $helper->name_controller = $this->name;
+        $helper->token = Tools::getAdminTokenLite('AdminModules');
+        $helper->currentIndex = AdminController::$currentIndex . '&configure=' . $this->name;
+        $helper->default_form_language = (int) Configuration::get('PS_LANG_DEFAULT');
+        $helper->allow_employee_form_lang = Configuration::get('PS_BO_ALLOW_EMPLOYEE_FORM_LANG') ?: 0;
+        $helper->title = $this->displayName;
+        $helper->show_toolbar = true;
+        $helper->toolbar_scroll = true;
+        $helper->submit_action = 'submit' . $this->name;
+
+        $helper->fields_value[self::CONFIG_ENABLED] = Configuration::get(self::CONFIG_ENABLED);
+        $helper->fields_value[self::CONFIG_PUBLIC_KEY] = Configuration::get(self::CONFIG_PUBLIC_KEY);
+        $helper->fields_value[self::CONFIG_SECRET_KEY] = Configuration::get(self::CONFIG_SECRET_KEY);
+        $helper->fields_value[self::CONFIG_ENVIRONMENT] = Configuration::get(self::CONFIG_ENVIRONMENT);
+        $helper->fields_value[self::CONFIG_CURRENCY] = Configuration::get(self::CONFIG_CURRENCY);
+        $helper->fields_value[self::CONFIG_SUCCESS_URL] = Configuration::get(self::CONFIG_SUCCESS_URL);
+
+        $channels = json_decode(Configuration::get(self::CONFIG_CHANNELS), true) ?: [];
+        $helper->fields_value[self::CONFIG_CHANNELS . '_card'] = in_array('card', $channels);
+        $helper->fields_value[self::CONFIG_CHANNELS . '_mobile-money'] = in_array('mobile-money', $channels);
+
+        return $helper->generateForm($form);
+    }
+
+    /**
+     * Hook to display payment options at checkout
+     *
+     * @param array $params
+     *
+     * @return array|null
+     */
+    public function hookPaymentOptions($params)
+    {
+        if (!$this->active || !Configuration::get(self::CONFIG_ENABLED)) {
+            return [];
+        }
+
+        if (empty(Configuration::get(self::CONFIG_PUBLIC_KEY))) {
+            return [];
+        }
+
+        $paymentOption = new PaymentOption();
+        $paymentOption->setCallToActionText($this->l('Pay with Lenco'))
+            ->setDescription($this->l('Pay securely with Card or Mobile Money'))
+            ->setAction($this->context->link->getModuleLink($this->name, 'payment', [], true))
+            ->setLogo(Media::getMediaPath(_PS_MODULE_DIR_ . $this->name . '/views/img/logo.png'));
+
+        return [$paymentOption];
+    }
+
+    /**
+     * Hook to display payment return
+     *
+     * @param array $params
+     *
+     * @return string|null
+     */
+    public function hookPaymentReturn($params)
+    {
+        if (!$this->active || !Configuration::get(self::CONFIG_ENABLED)) {
+            return '';
+        }
+
+        $order = isset($params['order']) ? $params['order'] : $params['objOrder'];
+
+        if ($order->getCurrentOrderState()->id !== (int) Configuration::get('PS_OS_ERROR')) {
+            $this->context->smarty->assign([
+                'status' => 'ok',
+                'reference' => $order->reference,
+            ]);
+        } else {
+            $this->context->smarty->assign('status', 'failed');
+        }
+
+        return $this->display(__FILE__, 'views/templates/hook/payment_return.tpl');
+    }
+
+    /**
+     * Hook to display order confirmation
+     *
+     * @param array $params
+     *
+     * @return string|null
+     */
+    public function hookDisplayOrderConfirmation($params)
+    {
+        if (!$this->active || !Configuration::get(self::CONFIG_ENABLED)) {
+            return '';
+        }
+
+        $order = isset($params['order']) ? $params['order'] : $params['objOrder'];
+
+        if ($order->module !== $this->name) {
+            return '';
+        }
+
+        $this->context->smarty->assign([
+            'order' => $order,
+            'reference' => $order->reference,
+        ]);
+
+        return $this->display(__FILE__, 'views/templates/hook/order_confirmation.tpl');
+    }
+
+    /**
+     * Hook to display Lenco info in admin order
+     *
+     * @param array $params
+     *
+     * @return string|null
+     */
+    public function hookDisplayAdminOrderMainBottom($params)
+    {
+        if (!$this->active) {
+            return '';
+        }
+
+        $order = new Order((int) $params['id_order']);
+
+        if ($order->module !== $this->name) {
+            return '';
+        }
+
+        $transaction = $this->getTransactionByOrderId($order->id);
+
+        $this->context->smarty->assign([
+            'order' => $order,
+            'transaction' => $transaction,
+        ]);
+
+        return $this->display(__FILE__, 'views/templates/hook/admin_order.tpl');
+    }
+
+    /**
+     * Get transaction by order ID
+     *
+     * @param int $idOrder
+     *
+     * @return array|false
+     */
+    public function getTransactionByOrderId($idOrder)
+    {
+        return Db::getInstance()->getRow(
+            'SELECT * FROM `' . _DB_PREFIX_ . 'lenco_transactions` 
+            WHERE `id_order` = ' . (int) $idOrder
+        );
+    }
+
+    /**
+     * Get transaction by reference
+     *
+     * @param string $reference
+     *
+     * @return array|false
+     */
+    public function getTransactionByReference($reference)
+    {
+        return Db::getInstance()->getRow(
+            'SELECT * FROM `' . _DB_PREFIX_ . 'lenco_transactions` 
+            WHERE `reference` = "' . pSQL($reference) . '"'
+        );
+    }
+
+    /**
+     * Get API URL based on environment
+     *
+     * @return string
+     */
+    public function getApiUrl()
+    {
+        return Configuration::get(self::CONFIG_ENVIRONMENT) === 'production'
+            ? self::LIVEL_API_URL
+            : self::SANDBOX_API_URL;
+    }
+
+    /**
+     * Get JS URL based on environment
+     *
+     * @return string
+     */
+    public function getJsUrl()
+    {
+        return Configuration::get(self::CONFIG_ENVIRONMENT) === 'production'
+            ? self::LIVEL_JS_URL
+            : self::SANDBOX_JS_URL;
+    }
+
+    /**
+     * Verify transaction with Lenco API
+     *
+     * @param string $reference
+     *
+     * @return array|false
+     */
+    public function verifyTransaction($reference)
+    {
+        $secretKey = Configuration::get(self::CONFIG_SECRET_KEY);
+        $apiUrl = $this->getApiUrl();
+
+        if (empty($secretKey)) {
+            return false;
+        }
+
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $apiUrl . '/collections/status/' . $reference,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => [
+                'Authorization: Bearer ' . $secretKey,
+                'Content-Type: application/json',
+            ],
+        ]);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($httpCode !== 200) {
+            return false;
+        }
+
+        return json_decode($response, true);
+    }
+
+    /**
+     * Generate unique payment reference
+     *
+     * @return string
+     */
+    public function generateReference()
+    {
+        return 'LENCO-' . time() . '-' . Tools::strtoupper(Tools::passwdGen(8));
+    }
+
+    /**
+     * Save transaction to database
+     *
+     * @param int    $idOrder
+     * @param string $reference
+     * @param float  $amount
+     * @param string $currency
+     * @param string $status
+     *
+     * @return bool
+     */
+    public function saveTransaction($idOrder, $reference, $amount, $currency, $status = 'pending')
+    {
+        return Db::getInstance()->insert('lenco_transactions', [
+            'id_order' => (int) $idOrder,
+            'reference' => pSQL($reference),
+            'amount' => (float) $amount,
+            'currency' => pSQL($currency),
+            'status' => pSQL($status),
+            'created_at' => date('Y-m-d H:i:s'),
+        ]);
+    }
+
+    /**
+     * Update transaction status
+     *
+     * @param string $reference
+     * @param string $status
+     * @param string $response
+     *
+     * @return bool
+     */
+    public function updateTransaction($reference, $status, $response = '')
+    {
+        return Db::getInstance()->update('lenco_transactions', [
+            'status' => pSQL($status),
+            'lenco_response' => pSQL($response),
+            'updated_at' => date('Y-m-d H:i:s'),
+        ], 'reference = "' . pSQL($reference) . '"');
+    }
+}
